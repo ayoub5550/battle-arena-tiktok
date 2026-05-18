@@ -291,15 +291,7 @@ def main():
         username = os.environ.get("TIKTOK_USERNAME", "")
         start_live_listener(username, tts)
 
-        # 1. Create the FIFO first
-        from stream_manager import setup_audio_fifo
-        setup_audio_fifo()
-
-        # 2. Start audio writer thread (blocks on open until FFmpeg opens read end)
-        audio_thread = threading.Thread(target=audio_writer, args=(AUDIO_FIFO, mixer), daemon=True)
-        audio_thread.start()
-
-        # 3. Start FFmpeg (opens FIFO for reading — unblocks audio writer)
+        # Start FFmpeg with file-based audio (no FIFO needed)
         ffmpeg_proc = start_ffmpeg(stream_info["rtmp_url"])
 
         if ffmpeg_proc is None:
