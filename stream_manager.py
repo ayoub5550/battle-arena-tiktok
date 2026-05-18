@@ -198,7 +198,11 @@ def start_ffmpeg(rtmp_url: str) -> subprocess.Popen:
         stderr_file.close()
         with open(stderr_path) as f:
             err = f.read()
-        log.warning(f"FFmpeg exited (code={proc.returncode}): {err[-300:]}")
+        # Log last 1500 chars to capture the actual error
+        log.warning(f"FFmpeg exited (code={proc.returncode})")
+        for line in err[-1500:].split('\n'):
+            if line.strip():
+                log.warning(f"  ffmpeg: {line.strip()}")
     threading.Thread(target=_monitor_ffmpeg, daemon=True).start()
 
     log.info("FFmpeg started ✓")
