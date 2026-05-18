@@ -320,13 +320,24 @@ def main():
         except Exception:
             ffmpeg_proc.kill()
 
+        # Read FFmpeg error log
+        try:
+            with open("/tmp/ffmpeg_stderr.log") as f:
+                err = f.read()
+            if err.strip():
+                for line in err.strip().split('\n')[-20:]:
+                    if line.strip() and 'frame=' not in line:
+                        log.warning(f"ffmpeg: {line.strip()}")
+        except Exception:
+            pass
+
         if running:
-            log.info("Stream ended. Restarting in 10s…")
+            log.info("Stream ended. Restarting in 30s…")
             try:
                 end_stream()
             except Exception:
                 pass
-            time.sleep(10)
+            time.sleep(30)
 
     log.info("Ending stream…")
     try:
