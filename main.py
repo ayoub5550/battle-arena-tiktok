@@ -23,7 +23,7 @@ from game_engine import BattleArena, GIFT_COIN_MAP
 from renderer import ArenaRenderer
 from audio_mixer import AudioMixer
 from tts_engine import TTSEngine
-from stream_manager import create_stream, end_stream, start_ffmpeg
+from stream_manager import create_stream, end_stream, start_ffmpeg, AUDIO_FIFO
 
 logging.basicConfig(
     level=logging.INFO,
@@ -205,21 +205,33 @@ def process_events(tts: TTSEngine):
             pass  # Already handled in gift event
 
 
-def audio_writer(audio_fd: int, mixer: AudioMixer):
-    """Background thread: writes mixed audio to FFmpeg pipe."""
+def audio_writer(fifo_path: str, mixer: AudioMixer):
+    """Background thread: writes mixed audio to FFmpeg via named FIFO."""
     frame_dur = 1.0 / FPS
+    log.info(f"Audio writer opening FIFO: {fifo_path}")
+    try:
+        fd = os.open(fifo_path, os.O_WRONLY)
+        log.info("Audio FIFO opened for writing ✓")
+    except OSError as e:
+        log.error(f"Cannot open audio FIFO: {e}")
+        return
+
     while running:
         t0 = time.time()
         chunk = mixer.get_chunk(AUDIO_SAMPLES_PER_FRAME)
         try:
-            os.write(audio_fd, chunk)
+            os.write(fd, chunk)
         except OSError:
-            log.error("Audio pipe broken!")
+            log.error("Audio FIFO broken!")
             break
         elapsed = time.time() - t0
         sleep = frame_dur - elapsed
         if sleep > 0:
             time.sleep(sleep)
+    try:
+        os.close(fd)
+    except OSError:
+        pass
 
 
 def game_loop(ffmpeg_proc, renderer: ArenaRenderer, tts: TTSEngine):
@@ -286,27 +298,21 @@ def main():
         username = os.environ.get("TIKTOK_USERNAME", "")
         start_live_listener(username, tts)
 
-        # Setup audio pipe
-        audio_read_fd, audio_write_fd = os.pipe()
+        # Start audio writer FIRST (opens FIFO for writing — blocks until FFmpeg opens reader)
+        audio_thread = threading.Thread(target=audio_writer, args=(AUDIO_FIFO, mixer), daemon=True)
+        audio_thread.start()
 
-        # Start FFmpeg
-        ffmpeg_proc = start_ffmpeg(stream_info["rtmp_url"], audio_read_fd)
-        # Close read end in parent
-        os.close(audio_read_fd)
+        # Start FFmpeg (opens FIFO for reading — unblocks audio writer)
+        ffmpeg_proc = start_ffmpeg(stream_info["rtmp_url"])
 
         if ffmpeg_proc is None:
             log.error("FFmpeg failed. Retrying in 15s…")
-            os.close(audio_write_fd)
             try:
                 end_stream()
             except Exception:
                 pass
             time.sleep(15)
             continue
-
-        # Start audio writer thread
-        audio_thread = threading.Thread(target=audio_writer, args=(audio_write_fd, mixer), daemon=True)
-        audio_thread.start()
 
         # Run game loop
         try:
@@ -319,10 +325,6 @@ def main():
         # Cleanup
         log.info("Cleaning up…")
         tts.stop()
-        try:
-            os.close(audio_write_fd)
-        except OSError:
-            pass
         try:
             ffmpeg_proc.stdin.close()
             ffmpeg_proc.wait(timeout=5)

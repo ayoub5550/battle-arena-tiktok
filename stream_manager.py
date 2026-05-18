@@ -127,18 +127,34 @@ def end_stream():
         log.warning(f"End stream error: {e}")
 
 
-def start_ffmpeg(rtmp_url: str, audio_read_fd: int) -> subprocess.Popen:
-    """Start FFmpeg with video on stdin and audio on a pipe fd."""
+AUDIO_FIFO = "/tmp/audio_pipe"
+
+
+def setup_audio_fifo() -> str:
+    """Create a named FIFO pipe for audio data."""
+    if os.path.exists(AUDIO_FIFO):
+        os.remove(AUDIO_FIFO)
+    os.mkfifo(AUDIO_FIFO)
+    log.info(f"Audio FIFO created: {AUDIO_FIFO}")
+    return AUDIO_FIFO
+
+
+def start_ffmpeg(rtmp_url: str) -> subprocess.Popen:
+    """Start FFmpeg with video on stdin and audio on a named FIFO."""
+
+    fifo = setup_audio_fifo()
 
     cmd = [
         "ffmpeg", "-y",
         # Input 0: raw video from stdin
         "-f", "rawvideo", "-vcodec", "rawvideo",
         "-pix_fmt", "rgb24", "-s", "720x1280", "-r", "15",
+        "-thread_queue_size", "512",
         "-i", "pipe:0",
-        # Input 1: raw audio from pipe
+        # Input 1: raw audio from named pipe
         "-f", "s16le", "-ar", "44100", "-ac", "2",
-        "-i", f"pipe:{audio_read_fd}",
+        "-thread_queue_size", "512",
+        "-i", fifo,
         # Video encoding
         "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
         "-pix_fmt", "yuv420p", "-g", "30",
@@ -157,10 +173,9 @@ def start_ffmpeg(rtmp_url: str, audio_read_fd: int) -> subprocess.Popen:
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        pass_fds=(audio_read_fd,),
     )
 
-    time.sleep(1)
+    time.sleep(2)
     if proc.poll() is not None:
         stderr = proc.stderr.read().decode(errors="replace")
         log.error(f"FFmpeg crashed! {stderr[-500:]}")
