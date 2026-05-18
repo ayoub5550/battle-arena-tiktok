@@ -171,18 +171,35 @@ def start_ffmpeg(rtmp_url: str) -> subprocess.Popen:
 
     log.info(f"FFmpeg cmd: {' '.join(cmd[:20])}...")
 
+    # Write stderr to file to avoid buffer deadlock
+    stderr_path = "/tmp/ffmpeg_stderr.log"
+    stderr_file = open(stderr_path, "w")
+
     proc = subprocess.Popen(
         cmd,
         stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=stderr_file,
     )
 
     time.sleep(2)
     if proc.poll() is not None:
-        stderr = proc.stderr.read().decode(errors="replace")
-        log.error(f"FFmpeg crashed! {stderr[-500:]}")
+        stderr_file.close()
+        with open(stderr_path) as f:
+            err = f.read()
+        log.error(f"FFmpeg crashed! {err[-500:]}")
         return None
+
+    # Start a thread to periodically log FFmpeg status
+    import threading
+    def _monitor_ffmpeg():
+        while proc.poll() is None:
+            time.sleep(30)
+        stderr_file.close()
+        with open(stderr_path) as f:
+            err = f.read()
+        log.warning(f"FFmpeg exited (code={proc.returncode}): {err[-300:]}")
+    threading.Thread(target=_monitor_ffmpeg, daemon=True).start()
 
     log.info("FFmpeg started ✓")
     return proc
