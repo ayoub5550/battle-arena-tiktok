@@ -39,10 +39,29 @@ def get_server_url(session: requests.Session) -> str:
     return "https://webcast-normal.tiktokv.com/"
 
 
+def _end_existing_stream(session: requests.Session):
+    """End any lingering live stream to avoid 'Forbidden stream pushing'."""
+    try:
+        base = get_server_url(session)
+        params = {"aid": "1233", "app_name": "musical_ly", "device_platform": "android"}
+        resp = session.post(base + "webcast/room/finish_abnormal/", params=params, timeout=15)
+        result = resp.json()
+        if result.get("status_code") == 0:
+            log.info("Ended previous stream ✓")
+            time.sleep(2)  # Give TikTok a moment
+        else:
+            log.debug(f"No active stream to end: {result.get('status_code')}")
+    except Exception as e:
+        log.debug(f"End stream check: {e}")
+
+
 def create_stream(title: str = "⚔ Battle Arena — Comment to Join!") -> dict | None:
     cookies = load_cookies()
     s = requests.Session()
     s.cookies.update(cookies)
+
+    # Always end any lingering stream first
+    _end_existing_stream(s)
 
     base_url = get_server_url(s)
     log.info(f"Server URL: {base_url}")
@@ -102,8 +121,30 @@ def create_stream(title: str = "⚔ Battle Arena — Comment to Join!") -> dict 
                 "share_url": share_url,
             }
         else:
-            msg = result.get("data", {}).get("prompts", result)
-            log.error(f"Stream creation failed: {msg}")
+            status = result.get("status_code")
+            msg = result.get("data", {}).get("prompts", result.get("data", {}).get("message", ""))
+            log.error(f"Stream creation failed (status={status}): {msg}")
+            # If "You are Live now" (30005), try ending and retrying once
+            if status == 30005:
+                log.info("Already live — ending existing stream and retrying…")
+                _end_existing_stream(s)
+                time.sleep(3)
+                try:
+                    resp2 = s.post(base_url + "webcast/room/create/", params=params, data=data, timeout=30)
+                    r2 = resp2.json()
+                    if "stream_url" in r2.get("data", {}):
+                        rtmp_url = r2["data"]["stream_url"]["rtmp_push_url"]
+                        idx = rtmp_url.rfind("/")
+                        share_url = r2["data"].get("share_url", "")
+                        log.info(f"Stream created (retry)! Share: {share_url}")
+                        return {
+                            "base_url": rtmp_url[:idx],
+                            "key": rtmp_url[idx + 1:],
+                            "rtmp_url": rtmp_url,
+                            "share_url": share_url,
+                        }
+                except Exception as e2:
+                    log.error(f"Retry also failed: {e2}")
             return None
     except Exception as e:
         log.error(f"Error creating stream: {e}")
