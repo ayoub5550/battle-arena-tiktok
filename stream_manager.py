@@ -142,7 +142,10 @@ def setup_audio_fifo() -> str:
 def start_ffmpeg(rtmp_url: str) -> subprocess.Popen:
     """Start FFmpeg with video on stdin and audio on a named FIFO."""
 
-    fifo = setup_audio_fifo()
+    fifo = AUDIO_FIFO
+    # Ensure FIFO exists (caller should have created it already)
+    if not os.path.exists(fifo):
+        setup_audio_fifo()
 
     cmd = [
         "ffmpeg", "-y",

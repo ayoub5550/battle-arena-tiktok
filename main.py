@@ -208,13 +208,21 @@ def process_events(tts: TTSEngine):
 def audio_writer(fifo_path: str, mixer: AudioMixer):
     """Background thread: writes mixed audio to FFmpeg via named FIFO."""
     frame_dur = 1.0 / FPS
-    log.info(f"Audio writer opening FIFO: {fifo_path}")
-    try:
-        fd = os.open(fifo_path, os.O_WRONLY)
-        log.info("Audio FIFO opened for writing ✓")
-    except OSError as e:
-        log.error(f"Cannot open audio FIFO: {e}")
-        return
+    log.info(f"Audio writer waiting for FIFO: {fifo_path}")
+
+    # Retry opening — blocks until FFmpeg opens the read end
+    fd = None
+    for attempt in range(30):
+        try:
+            fd = os.open(fifo_path, os.O_WRONLY)
+            log.info("Audio FIFO opened for writing ✓")
+            break
+        except OSError as e:
+            if attempt < 29:
+                time.sleep(1)
+            else:
+                log.error(f"Cannot open audio FIFO after 30s: {e}")
+                return
 
     while running:
         t0 = time.time()
@@ -298,11 +306,15 @@ def main():
         username = os.environ.get("TIKTOK_USERNAME", "")
         start_live_listener(username, tts)
 
-        # Start audio writer FIRST (opens FIFO for writing — blocks until FFmpeg opens reader)
+        # 1. Create the FIFO first
+        from stream_manager import setup_audio_fifo
+        setup_audio_fifo()
+
+        # 2. Start audio writer thread (blocks on open until FFmpeg opens read end)
         audio_thread = threading.Thread(target=audio_writer, args=(AUDIO_FIFO, mixer), daemon=True)
         audio_thread.start()
 
-        # Start FFmpeg (opens FIFO for reading — unblocks audio writer)
+        # 3. Start FFmpeg (opens FIFO for reading — unblocks audio writer)
         ffmpeg_proc = start_ffmpeg(stream_info["rtmp_url"])
 
         if ffmpeg_proc is None:
