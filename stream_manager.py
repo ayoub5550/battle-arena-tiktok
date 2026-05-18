@@ -180,62 +180,24 @@ def setup_audio_fifo() -> str:
     return AUDIO_FIFO
 
 
-def _prepare_playlist(music_dir: str = "/app/music") -> str | None:
-    """Merge music files into a single file for FFmpeg stream_loop."""
-    if not os.path.isdir(music_dir):
-        return None
-    songs = sorted([
-        os.path.join(music_dir, f) for f in os.listdir(music_dir)
-        if f.endswith((".m4a", ".mp3", ".wav", ".ogg", ".aac"))
-    ])
-    if not songs:
-        return None
-    if len(songs) == 1:
-        return songs[0]
-
-    # Concat into one file
-    concat = "/tmp/playlist.txt"
-    merged = "/tmp/merged_music.m4a"
-    with open(concat, "w") as f:
-        for s in songs:
-            f.write(f"file '{s}'\n")
-    log.info(f"Merging {len(songs)} songs: {[os.path.basename(s) for s in songs]}")
-    try:
-        subprocess.run([
-            "ffmpeg", "-y", "-f", "concat", "-safe", "0",
-            "-i", concat, "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
-            merged,
-        ], capture_output=True, timeout=120, check=True)
-        log.info(f"Merged playlist ✓ ({os.path.getsize(merged) / 1024 / 1024:.1f} MB)")
-        return merged
-    except Exception as e:
-        log.warning(f"Merge failed: {e}, using first song")
-        return songs[0]
-
-
 def start_ffmpeg(rtmp_url: str) -> subprocess.Popen:
-    """Start FFmpeg with video on stdin and file-based audio (looped)."""
+    """Start FFmpeg with video on stdin and audio on a named FIFO."""
 
-    # Prepare music playlist
-    music_path = _prepare_playlist()
-    has_music = music_path and os.path.exists(music_path)
+    fifo = AUDIO_FIFO
+    if not os.path.exists(fifo):
+        setup_audio_fifo()
 
-    cmd = ["ffmpeg", "-y"]
-
-    # Input 0: raw video frames from pipe
-    cmd += [
+    cmd = [
+        "ffmpeg", "-y",
+        # Input 0: raw video from stdin
         "-f", "rawvideo", "-vcodec", "rawvideo",
         "-pix_fmt", "rgb24", "-s", "720x1280", "-r", "15",
+        "-thread_queue_size", "512",
         "-i", "pipe:0",
-    ]
-
-    # Input 1: audio (loop file infinitely, or silent)
-    if has_music:
-        cmd += ["-stream_loop", "-1", "-i", music_path]
-    else:
-        cmd += ["-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo"]
-
-    cmd += [
+        # Input 1: raw audio from named pipe
+        "-f", "s16le", "-ar", "44100", "-ac", "2",
+        "-thread_queue_size", "512",
+        "-i", fifo,
         # Video encoding
         "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
         "-pix_fmt", "yuv420p", "-g", "30",
