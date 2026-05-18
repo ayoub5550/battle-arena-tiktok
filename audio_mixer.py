@@ -15,22 +15,40 @@ BYTES_PER_SAMPLE = 2  # s16le
 class AudioMixer:
     """Mixes looped background music with TTS clips in real-time."""
 
-    def __init__(self, music_path: str, music_volume: float = 0.5):
+    def __init__(self, music_paths: list[str] | str, music_volume: float = 0.5):
         self.music_volume = music_volume
-        self.music_data: np.ndarray | None = None
+        self._tracks: list[np.ndarray] = []
+        self._current_track = 0
         self.music_pos = 0
         self._tts_queue: list[np.ndarray] = []
         self._tts_active: list[dict] = []
         self._lock = threading.Lock()
 
-        if music_path and os.path.exists(music_path):
-            self.music_data = self._decode_audio(music_path)
-            if self.music_data is not None:
-                log.info(f"Music loaded: {len(self.music_data)} samples ({len(self.music_data) / SAMPLE_RATE / CHANNELS:.1f}s)")
+        # Accept single path or list
+        if isinstance(music_paths, str):
+            music_paths = [music_paths]
+
+        for p in music_paths:
+            if p and os.path.exists(p):
+                data = self._decode_audio(p)
+                if data is not None:
+                    self._tracks.append(data)
+                    log.info(f"Music loaded: {os.path.basename(p)} — {len(data)} samples ({len(data) / SAMPLE_RATE / CHANNELS:.1f}s)")
+                else:
+                    log.warning(f"Failed to decode: {p}")
             else:
-                log.warning("Failed to decode music")
+                log.warning(f"Music file not found: {p}")
+
+        if self._tracks:
+            log.info(f"Total music tracks: {len(self._tracks)}")
         else:
-            log.warning(f"Music file not found: {music_path}")
+            log.warning("No music tracks loaded")
+
+    @property
+    def music_data(self) -> np.ndarray | None:
+        if not self._tracks:
+            return None
+        return self._tracks[self._current_track]
 
     @staticmethod
     def _decode_audio(path: str) -> np.ndarray | None:
@@ -87,19 +105,23 @@ class AudioMixer:
         total = num_samples * CHANNELS
         chunk = np.zeros(total, dtype=np.float32)
 
-        # Music
-        if self.music_data is not None and len(self.music_data) > 0:
+        # Music (sequential playlist with loop)
+        if self._tracks:
             remaining = total
             pos = 0
             while remaining > 0:
-                avail = len(self.music_data) - self.music_pos
+                track = self._tracks[self._current_track]
+                avail = len(track) - self.music_pos
                 take = min(remaining, avail)
-                chunk[pos:pos + take] = self.music_data[self.music_pos:self.music_pos + take].astype(np.float32) * self.music_volume
+                chunk[pos:pos + take] = track[self.music_pos:self.music_pos + take].astype(np.float32) * self.music_volume
                 self.music_pos += take
                 pos += take
                 remaining -= take
-                if self.music_pos >= len(self.music_data):
+                if self.music_pos >= len(track):
+                    # Advance to next track (loop back to first)
+                    self._current_track = (self._current_track + 1) % len(self._tracks)
                     self.music_pos = 0
+                    log.info(f"Now playing track {self._current_track + 1}/{len(self._tracks)}")
 
         # Move queued TTS to active
         with self._lock:

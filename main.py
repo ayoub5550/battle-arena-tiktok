@@ -62,42 +62,27 @@ signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
 
-def _prepare_music() -> str | None:
-    """Find or merge music files."""
+def _prepare_music() -> list[str]:
+    """Find all music files — return as a list for sequential playback."""
     music_dir = "/app/music"
     if not os.path.isdir(music_dir):
         music_dir = os.path.join(os.path.dirname(__file__), "music")
     if not os.path.isdir(music_dir):
-        return None
+        return []
 
     songs = sorted([
         os.path.join(music_dir, f)
         for f in os.listdir(music_dir)
         if f.endswith((".m4a", ".mp3", ".wav", ".ogg", ".aac"))
     ])
-    if not songs:
-        return None
-    if len(songs) == 1:
-        log.info(f"Single music file: {songs[0]}")
-        return songs[0]
+    log.info(f"Found {len(songs)} music files: {[os.path.basename(s) for s in songs]}")
+    return songs
 
-    # Merge into one file
-    import subprocess
-    concat_path = "/tmp/playlist.txt"
-    merged = "/tmp/merged_music.m4a"
-    with open(concat_path, "w") as f:
-        for s in songs:
-            f.write(f"file '{s}'\n")
-    log.info(f"Merging {len(songs)} songs…")
-    try:
-        subprocess.run([
-            "ffmpeg", "-y", "-f", "concat", "-safe", "0",
-            "-i", concat_path, "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
-            merged,
-        ], capture_output=True, timeout=120, check=True)
-        log.info(f"Merged playlist ✓ ({os.path.getsize(merged) / 1024 / 1024:.1f} MB)")
-        return merged
-    except Exception as e:
+
+def _prepare_music_old():
+    """Legacy — unused."""
+    pass
+    if False:
         log.warning(f"Merge failed: {e}, using first song")
         return songs[0]
 
@@ -285,9 +270,9 @@ def main():
     log.info("  ⚔  TikTok Battle Arena — Interactive Live Game")
     log.info("=" * 55)
 
-    # Prepare music
-    music_path = _prepare_music()
-    mixer = AudioMixer(music_path, music_volume=0.5)
+    # Prepare music (list of songs for sequential playback)
+    music_paths = _prepare_music()
+    mixer = AudioMixer(music_paths, music_volume=0.5)
     tts = TTSEngine(mixer)
     renderer = ArenaRenderer()
 
