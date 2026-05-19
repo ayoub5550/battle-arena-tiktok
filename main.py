@@ -105,24 +105,21 @@ def prepare_music():
 def build_ffmpeg_cmd(rtmp_url: str, music_concat: str | None) -> list:
     """Build the FFmpeg command for video + music → RTMP."""
 
-    # Filter: speed up, blur bg + center gameplay, saturate, title overlay
-    # Source is likely 16:9, target is 9:16 (720x1280)
-    # Strategy: blurred+zoomed background + crisp centered gameplay
+    # Filter: speed up, scale to fit 9:16 with black bars, saturate colors
+    # Lightweight pipeline — no blur/split to avoid OOM on Railway
+    # Escape single quotes in title for drawtext
+    safe_title = STREAM_TITLE.replace("'", "'\\''").replace(":", "\\:")
     vfilter = (
-        f"[0:v]setpts=PTS/{VIDEO_SPEED},split[bg][fg];"
-        # Background: zoom in + blur
-        f"[bg]scale=720:1280:force_original_aspect_ratio=increase,"
-        f"crop=720:1280,boxblur=25:5[blurred];"
-        # Foreground: fit width, keep aspect ratio
-        f"[fg]scale=700:-2:force_original_aspect_ratio=decrease[scaled];"
-        # Overlay centered
-        f"[blurred][scaled]overlay=(W-w)/2:(H-h)/2,"
+        f"[0:v]setpts=PTS/{VIDEO_SPEED},"
+        # Scale to fit 720 width, pad to 720x1280 (center with black bars)
+        f"scale=720:-2:force_original_aspect_ratio=decrease,"
+        f"pad=720:1280:(ow-iw)/2:(oh-ih)/2:color=0x0a0a0a,"
         # Color saturation
         f"eq=saturation={SATURATION},"
         # Title text at top
-        f"drawtext=text='{STREAM_TITLE}':"
-        f"fontsize=26:fontcolor=white:borderw=2:bordercolor=black@0.8:"
-        f"x=(w-text_w)/2:y=20:"
+        f"drawtext=text='{safe_title}':"
+        f"fontsize=24:fontcolor=white:borderw=2:bordercolor=black@0.8:"
+        f"x=(w-text_w)/2:y=15:"
         f"font=DejaVu Sans[v]"
     )
 
@@ -151,16 +148,17 @@ def build_ffmpeg_cmd(rtmp_url: str, music_concat: str | None) -> list:
         *inputs,
         "-filter_complex", full_filter,
         *maps,
-        # Video encoding
+        # Video encoding — ultrafast to minimize CPU/RAM
         "-c:v", "libx264",
-        "-preset", "veryfast",
-        "-tune", "film",
+        "-preset", "ultrafast",
+        "-tune", "zerolatency",
         "-pix_fmt", "yuv420p",
         "-b:v", VIDEO_BITRATE,
-        "-maxrate", f"{int(VIDEO_BITRATE.replace('k', '')) * 1.2:.0f}k" if "k" in VIDEO_BITRATE else VIDEO_BITRATE,
-        "-bufsize", f"{int(VIDEO_BITRATE.replace('k', '')) * 2:.0f}k" if "k" in VIDEO_BITRATE else VIDEO_BITRATE,
-        "-g", str(OUTPUT_FPS * 2),  # keyframe interval
+        "-maxrate", f"{int(VIDEO_BITRATE.replace('k', '')) + 500}k" if "k" in VIDEO_BITRATE else VIDEO_BITRATE,
+        "-bufsize", "3000k",
+        "-g", str(OUTPUT_FPS * 2),
         "-r", str(OUTPUT_FPS),
+        "-threads", "2",
         # Audio encoding
         "-c:a", "aac",
         "-b:a", "128k",
