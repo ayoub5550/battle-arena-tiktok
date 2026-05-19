@@ -1,9 +1,9 @@
 FROM python:3.11-slim
 
-# System deps
+# System deps: FFmpeg + fonts
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-        ffmpeg fonts-dejavu-core && \
+        ffmpeg curl fonts-dejavu-core && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

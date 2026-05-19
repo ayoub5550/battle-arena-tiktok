@@ -1,279 +1,281 @@
-"""Main — Snake AI Game on TikTok Live with music + TTS commentary."""
+"""Video Stream on TikTok Live — loops a video 24/7 with background music."""
 import logging
 import os
 import signal
+import subprocess
 import sys
-import threading
 import time
 
-import numpy as np
-
-from game import SnakeGame
-from stream_manager import (
-    create_stream, end_stream, start_ffmpeg,
-    setup_audio_fifo, AUDIO_FIFO,
-)
-from audio_mixer import AudioMixer
-from tts_engine import TTSEngine
+from stream_manager import create_stream, end_stream
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
 )
 log = logging.getLogger("main")
 
-# ── TikTok live events ──
-chat_available = False
-try:
-    from TikTokLive import TikTokLiveClient
-    from TikTokLive.events import (
-        CommentEvent, ConnectEvent, DisconnectEvent, GiftEvent,
-        JoinEvent, RoomUserSeqEvent,
-    )
-    chat_available = True
-    log.info("TikTokLive library loaded ✓")
-except ImportError as e:
-    log.warning(f"TikTokLive not available: {e}")
+VIDEO_PATH = "/app/video.mp4"
+MUSIC_DIR = "/app/music"
+MUSIC_CONCAT = "/tmp/music_all.txt"  # FFmpeg concat list
+STREAM_TITLE = os.environ.get(
+    "STREAM_TITLE",
+    "🎮 Elden Ring — All Bosses NO DAMAGE | 24/7",
+)
 
+# ── Settings ──
+VIDEO_SPEED = float(os.environ.get("VIDEO_SPEED", "1.3"))
+VIDEO_VOLUME = float(os.environ.get("VIDEO_VOLUME", "1.0"))  # 100%
+MUSIC_VOLUME = float(os.environ.get("MUSIC_VOLUME", "0.5"))  # 50%
+SATURATION = float(os.environ.get("SATURATION", "1.35"))
+OUTPUT_FPS = int(os.environ.get("OUTPUT_FPS", "30"))
+VIDEO_BITRATE = os.environ.get("VIDEO_BITRATE", "2500k")
 
-game = SnakeGame()
 running = True
 
-GIFT_APPLE_MAP = {
-    "Rose": 5, "rose": 5, "TikTok": 5, "Finger Heart": 5, "GG": 5,
-    "Ice Cream Cone": 10, "Doughnut": 15, "Perfume": 20,
-    "Bouquet": 50, "Love You": 50, "Garland": 50, "Sunglasses": 50,
-    "Hand Hearts": 100, "Butterfly": 100, "Family": 100,
-    "Hat and Mustache": 150, "Corgi": 150, "Cap": 150,
-    "Hands Up": 499, "Donate": 499, "Gaming Keyboard": 499,
-    "Train": 1000, "Elephant": 1000, "Gift Box": 1500,
-    "Lion": 1500, "Universe": 2000, "Whale": 5000,
-}
 
-
-def signal_handler(sig, frame):
+def handle_signal(sig, frame):
     global running
-    log.info("Shutting down…")
+    log.info(f"Signal {sig} received, shutting down...")
     running = False
 
-signal.signal(signal.SIGINT, signal_handler)
-signal.signal(signal.SIGTERM, signal_handler)
+
+signal.signal(signal.SIGTERM, handle_signal)
+signal.signal(signal.SIGINT, handle_signal)
 
 
-def start_live_listener(username: str, tts: TTSEngine):
-    """Connect to TikTok live chat/gifts and feed to game + TTS."""
-    if not chat_available or not username:
-        log.info(f"Live listener skipped (chat={chat_available}, user={username!r})")
-        return
+def download_video():
+    """Download video from URL if not present locally."""
+    if os.path.exists(VIDEO_PATH):
+        size = os.path.getsize(VIDEO_PATH)
+        if size > 10_000_000:  # >10MB = likely valid
+            log.info(f"Video already exists: {size / 1024 / 1024:.0f} MB")
+            return True
 
-    client = TikTokLiveClient(unique_id=username)
+    video_url = os.environ.get("VIDEO_URL", "")
+    if not video_url:
+        log.error("No VIDEO_URL set and no local video file!")
+        return False
 
-    @client.on(ConnectEvent)
-    async def on_connect(event: ConnectEvent):
-        log.info(f"Live connected to @{username}")
-
-    @client.on(DisconnectEvent)
-    async def on_disconnect(event: DisconnectEvent):
-        log.warning("Live disconnected — will reconnect…")
-
-    @client.on(CommentEvent)
-    async def on_comment(event: CommentEvent):
-        try:
-            user = event.user.nickname or event.user.unique_id
-            text = event.comment.strip()
-            game.add_message(user, text)
-        except Exception as e:
-            log.debug(f"Comment error: {e}")
-
-    @client.on(GiftEvent)
-    async def on_gift(event: GiftEvent):
-        try:
-            user = getattr(event, "user", None)
-            uname = "Viewer"
-            if user:
-                uname = getattr(user, "nickname", "") or getattr(user, "unique_id", "Viewer")
-            gift = getattr(event, "gift", None)
-            gift_name = getattr(gift, "name", "") if gift else ""
-            if gift_name in GIFT_APPLE_MAP:
-                apple_count = GIFT_APPLE_MAP[gift_name]
-            else:
-                coins = getattr(gift, "diamond_count", 0) or 1
-                repeat = getattr(event, "repeat_count", 1) or 1
-                apple_count = max(1, int(coins * repeat * 0.5))
-            game.add_apples(uname, apple_count)
-            tts.announce_gift(uname, gift_name or "gift")
-            log.info(f"Gift: {uname} → {gift_name} → +{apple_count} apples")
-        except Exception as e:
-            log.warning(f"Gift error: {e}")
-
-    @client.on(JoinEvent)
-    async def on_join(event: JoinEvent):
-        try:
-            user = event.user.nickname or event.user.unique_id
-            tts.greet(user)
-        except:
-            pass
-
-    @client.on(RoomUserSeqEvent)
-    async def on_viewer_count(event: RoomUserSeqEvent):
-        try:
-            game.viewer_count = getattr(event, "total_user", 0) or 0
-        except:
-            pass
-
-    def run_listener():
-        while running:
-            try:
-                client.run()
-            except Exception as e:
-                log.error(f"Live listener error: {e}")
-                time.sleep(5)
-
-    t = threading.Thread(target=run_listener, daemon=True)
-    t.start()
-    log.info("Live listener thread started")
-
-
-def audio_writer(fifo_path: str, mixer: AudioMixer):
-    """Write mixed audio to FIFO continuously."""
-    log.info(f"Audio writer waiting for FIFO: {fifo_path}")
-    fd = os.open(fifo_path, os.O_WRONLY)
-    log.info("Audio FIFO opened for writing ✓")
-    chunk_samples = 1024  # samples per channel per chunk
+    log.info(f"Downloading video from: {video_url[:80]}...")
     try:
-        while running:
-            data = mixer.get_chunk(chunk_samples)
-            try:
-                os.write(fd, data)
-            except OSError:
-                break
+        result = subprocess.run(
+            [
+                "curl", "-L", "-o", VIDEO_PATH,
+                "-H", "User-Agent: Mozilla/5.0",
+                "--retry", "3",
+                "--retry-delay", "5",
+                "--max-time", "1800",  # 30 min max
+                "--progress-bar",
+                video_url,
+            ],
+            timeout=2000,
+        )
+        if result.returncode != 0:
+            log.error(f"Download failed with code {result.returncode}")
+            return False
+
+        size = os.path.getsize(VIDEO_PATH)
+        log.info(f"Download complete: {size / 1024 / 1024:.0f} MB")
+        return size > 10_000_000
     except Exception as e:
-        log.error(f"Audio writer error: {e}")
-    finally:
-        os.close(fd)
+        log.error(f"Download error: {e}")
+        return False
 
 
-def game_loop(ffmpeg_proc, tts: TTSEngine):
-    """Main loop: step game → render → send frame to FFmpeg, with TTS."""
-    frame_interval = 1.0 / 15  # 15 FPS
-    step_interval = 0.08       # snake moves every 80ms
-    last_step = time.time()
-    last_score = 0
-    last_milestone = 0
+def prepare_music():
+    """Create a concat list for all music files in the music directory."""
+    music_files = sorted(
+        [f for f in os.listdir(MUSIC_DIR) if f.endswith((".m4a", ".mp3", ".aac", ".ogg"))],
+    )
+    if not music_files:
+        log.warning("No music files found!")
+        return None
 
-    while running:
-        t0 = time.time()
+    # Write concat list
+    with open(MUSIC_CONCAT, "w") as f:
+        for mf in music_files:
+            path = os.path.join(MUSIC_DIR, mf)
+            f.write(f"file '{path}'\n")
 
-        if t0 - last_step >= step_interval:
-            game.step()
-            last_step = t0
+    log.info(f"Music playlist: {', '.join(music_files)}")
+    return MUSIC_CONCAT
 
-            # TTS for score milestones
-            if game.score > last_score:
-                last_score = game.score
-                if game.score % 25 == 0 and game.score != last_milestone:
-                    last_milestone = game.score
-                    tts.say(f"Amazing! Score reached {game.score}! Snake length {len(game.snake)}!")
-            # TTS when snake dies
-            if not game.alive and last_score > 0:
-                tts.say(f"Snake died at score {last_score}. New game starting!")
-                last_score = 0
 
-        frame_data = game.render()
-        try:
-            ffmpeg_proc.stdin.write(frame_data)
-        except (BrokenPipeError, OSError):
-            log.error("FFmpeg pipe broken!")
-            break
+def build_ffmpeg_cmd(rtmp_url: str, music_concat: str | None) -> list:
+    """Build the FFmpeg command for video + music → RTMP."""
 
-        elapsed = time.time() - t0
-        sleep_time = frame_interval - elapsed
-        if sleep_time > 0:
-            time.sleep(sleep_time)
+    # Filter: speed up, blur bg + center gameplay, saturate, title overlay
+    # Source is likely 16:9, target is 9:16 (720x1280)
+    # Strategy: blurred+zoomed background + crisp centered gameplay
+    vfilter = (
+        f"[0:v]setpts=PTS/{VIDEO_SPEED},split[bg][fg];"
+        # Background: zoom in + blur
+        f"[bg]scale=720:1280:force_original_aspect_ratio=increase,"
+        f"crop=720:1280,boxblur=25:5[blurred];"
+        # Foreground: fit width, keep aspect ratio
+        f"[fg]scale=700:-2:force_original_aspect_ratio=decrease[scaled];"
+        # Overlay centered
+        f"[blurred][scaled]overlay=(W-w)/2:(H-h)/2,"
+        # Color saturation
+        f"eq=saturation={SATURATION},"
+        # Title text at top
+        f"drawtext=text='{STREAM_TITLE}':"
+        f"fontsize=26:fontcolor=white:borderw=2:bordercolor=black@0.8:"
+        f"x=(w-text_w)/2:y=20:"
+        f"font=DejaVu Sans[v]"
+    )
+
+    # Audio: speed up video audio + mix with music
+    if music_concat:
+        afilter = (
+            f"[0:a]atempo={VIDEO_SPEED},volume={VIDEO_VOLUME}[va];"
+            f"[1:a]volume={MUSIC_VOLUME}[ma];"
+            f"[va][ma]amix=inputs=2:duration=first:dropout_transition=3[a]"
+        )
+        inputs = [
+            "-stream_loop", "-1", "-i", VIDEO_PATH,
+            "-stream_loop", "-1", "-safe", "0", "-f", "concat", "-i", music_concat,
+        ]
+        maps = ["-map", "[v]", "-map", "[a]"]
+    else:
+        afilter = f"[0:a]atempo={VIDEO_SPEED},volume={VIDEO_VOLUME}[a]"
+        inputs = ["-stream_loop", "-1", "-i", VIDEO_PATH]
+        maps = ["-map", "[v]", "-map", "[a]"]
+
+    full_filter = f"{vfilter};{afilter}"
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-loglevel", "warning",
+        *inputs,
+        "-filter_complex", full_filter,
+        *maps,
+        # Video encoding
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-tune", "film",
+        "-pix_fmt", "yuv420p",
+        "-b:v", VIDEO_BITRATE,
+        "-maxrate", f"{int(VIDEO_BITRATE.replace('k', '')) * 1.2:.0f}k" if "k" in VIDEO_BITRATE else VIDEO_BITRATE,
+        "-bufsize", f"{int(VIDEO_BITRATE.replace('k', '')) * 2:.0f}k" if "k" in VIDEO_BITRATE else VIDEO_BITRATE,
+        "-g", str(OUTPUT_FPS * 2),  # keyframe interval
+        "-r", str(OUTPUT_FPS),
+        # Audio encoding
+        "-c:a", "aac",
+        "-b:a", "128k",
+        "-ar", "44100",
+        # Output
+        "-f", "flv",
+        "-flvflags", "no_duration_filesize",
+        rtmp_url,
+    ]
+
+    return cmd
+
+
+def start_ffmpeg(rtmp_url: str, music_concat: str | None) -> subprocess.Popen | None:
+    """Start the FFmpeg streaming process."""
+    cmd = build_ffmpeg_cmd(rtmp_url, music_concat)
+    log.info(f"FFmpeg command (first 15 args): {' '.join(cmd[:15])}...")
+
+    stderr_path = "/tmp/ffmpeg_stderr.log"
+    stderr_file = open(stderr_path, "w")
+
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=stderr_file,
+    )
+
+    time.sleep(5)
+    if proc.poll() is not None:
+        stderr_file.close()
+        with open(stderr_path) as f:
+            err = f.read()
+        log.error(f"FFmpeg crashed immediately!\n{err[-2000:]}")
+        return None
+
+    log.info("FFmpeg started successfully ✓")
+    return proc
 
 
 def main():
-    global running
+    log.info("=" * 50)
+    log.info("VIDEO STREAM — TikTok Live")
+    log.info("=" * 50)
 
-    log.info("=" * 55)
-    log.info("  🐍 TikTok Snake AI — Interactive Live Stream")
-    log.info("=" * 55)
+    # Step 1: Download video
+    if not download_video():
+        log.error("Cannot start without video. Exiting.")
+        sys.exit(1)
 
-    # Discover music
-    music_dir = "/app/music"
-    music_files = []
-    if os.path.isdir(music_dir):
-        music_files = sorted([
-            os.path.join(music_dir, f) for f in os.listdir(music_dir)
-            if f.endswith((".m4a", ".mp3", ".wav", ".ogg", ".aac"))
-        ])
-    log.info(f"Found {len(music_files)} music files: {[os.path.basename(f) for f in music_files]}")
+    # Step 2: Prepare music playlist
+    music_concat = prepare_music()
 
-    # Audio mixer: music at 50% volume
-    mixer = AudioMixer(music_files, music_volume=0.5)
-    tts = TTSEngine(mixer)
+    # Step 3: Main loop with auto-restart
+    restart_count = 0
+    max_restarts = 50
 
-    while running:
-        log.info("Creating TikTok stream…")
-        stream_info = create_stream(title="🐍 Snake AI Live — Send Gifts = More Apples! 🍎")
-        if not stream_info:
-            log.error("Failed to create stream. Retrying in 30s…")
+    while running and restart_count < max_restarts:
+        restart_count += 1
+        log.info(f"\n{'='*40} Stream attempt #{restart_count} {'='*40}")
+
+        # Create TikTok stream
+        stream = create_stream(title=STREAM_TITLE)
+        if not stream:
+            log.error("Failed to create TikTok stream. Retrying in 30s...")
             time.sleep(30)
             continue
 
-        log.info(f"Stream live! Share: {stream_info['share_url']}")
+        log.info(f"RTMP URL: {stream['rtmp_url'][:60]}...")
+        log.info(f"Share URL: {stream.get('share_url', 'N/A')}")
 
-        # Live listener
-        username = os.environ.get("TIKTOK_USERNAME", "")
-        start_live_listener(username, tts)
-
-        # FIFO audio
-        setup_audio_fifo()
-        audio_thread = threading.Thread(target=audio_writer, args=(AUDIO_FIFO, mixer), daemon=True)
-        audio_thread.start()
-
-        # FFmpeg
-        ffmpeg_proc = start_ffmpeg(stream_info["rtmp_url"])
-        if ffmpeg_proc is None:
-            log.error("FFmpeg failed. Retrying in 15s…")
-            try:
-                end_stream()
-            except:
-                pass
+        # Start FFmpeg
+        ffmpeg_proc = start_ffmpeg(stream["rtmp_url"], music_concat)
+        if not ffmpeg_proc:
+            log.error("FFmpeg failed to start. Retrying in 15s...")
             time.sleep(15)
             continue
 
-        # Game loop
-        try:
-            game_loop(ffmpeg_proc, tts)
-        except KeyboardInterrupt:
-            running = False
-        except Exception as e:
-            log.error(f"Game loop error: {e}")
+        # Monitor FFmpeg
+        start_time = time.time()
+        while running:
+            ret = ffmpeg_proc.poll()
+            if ret is not None:
+                elapsed = time.time() - start_time
+                log.warning(f"FFmpeg exited (code={ret}) after {elapsed:.0f}s")
+                # Read stderr
+                try:
+                    with open("/tmp/ffmpeg_stderr.log") as f:
+                        err = f.read()
+                    for line in err[-1000:].split("\n"):
+                        if line.strip():
+                            log.warning(f"  ffmpeg: {line.strip()}")
+                except:
+                    pass
+                break
+            time.sleep(10)
 
         # Cleanup
-        log.info("Cleaning up…")
-        try:
-            ffmpeg_proc.stdin.close()
-            ffmpeg_proc.wait(timeout=5)
-        except:
-            ffmpeg_proc.kill()
+        if ffmpeg_proc and ffmpeg_proc.poll() is None:
+            ffmpeg_proc.terminate()
+            try:
+                ffmpeg_proc.wait(timeout=10)
+            except:
+                ffmpeg_proc.kill()
 
         if running:
-            log.info("Stream ended. Restarting in 30s…")
-            try:
-                end_stream()
-            except:
-                pass
-            time.sleep(30)
+            wait = min(15 + restart_count * 5, 120)
+            log.info(f"Restarting in {wait}s...")
+            time.sleep(wait)
 
-    log.info("Ending stream…")
+    # End stream on shutdown
     try:
         end_stream()
     except:
         pass
-    tts.stop()
-    log.info("Goodbye! 🐍")
+    log.info("Shutdown complete.")
 
 
 if __name__ == "__main__":

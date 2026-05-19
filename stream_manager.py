@@ -1,9 +1,8 @@
-"""TikTok stream creation + FFmpeg RTMP streaming with audio pipe."""
+"""TikTok stream creation + end (reused from snake game)."""
 import json
 import logging
 import os
 import random
-import subprocess
 import time
 import requests
 
@@ -40,7 +39,7 @@ def get_server_url(session: requests.Session) -> str:
 
 
 def _end_existing_stream(session: requests.Session):
-    """End any lingering live stream to avoid 'Forbidden stream pushing'."""
+    """End any lingering live stream."""
     try:
         base = get_server_url(session)
         params = {"aid": "1233", "app_name": "musical_ly", "device_platform": "android"}
@@ -48,19 +47,18 @@ def _end_existing_stream(session: requests.Session):
         result = resp.json()
         if result.get("status_code") == 0:
             log.info("Ended previous stream ✓")
-            time.sleep(2)  # Give TikTok a moment
+            time.sleep(2)
         else:
             log.debug(f"No active stream to end: {result.get('status_code')}")
     except Exception as e:
         log.debug(f"End stream check: {e}")
 
 
-def create_stream(title: str = "⚔ Battle Arena — Comment to Join!") -> dict | None:
+def create_stream(title: str = "🎮 Live Stream 24/7") -> dict | None:
     cookies = load_cookies()
     s = requests.Session()
     s.cookies.update(cookies)
 
-    # Always end any lingering stream first
     _end_existing_stream(s)
 
     base_url = get_server_url(s)
@@ -124,9 +122,8 @@ def create_stream(title: str = "⚔ Battle Arena — Comment to Join!") -> dict 
             status = result.get("status_code")
             msg = result.get("data", {}).get("prompts", result.get("data", {}).get("message", ""))
             log.error(f"Stream creation failed (status={status}): {msg}")
-            # If "You are Live now" (30005), try ending and retrying once
             if status == 30005:
-                log.info("Already live — ending existing stream and retrying…")
+                log.info("Already live — ending and retrying…")
                 _end_existing_stream(s)
                 time.sleep(3)
                 try:
@@ -166,84 +163,3 @@ def end_stream():
         log.info(f"Stream ended: {resp.json()}")
     except Exception as e:
         log.warning(f"End stream error: {e}")
-
-
-AUDIO_FIFO = "/tmp/audio_pipe"
-
-
-def setup_audio_fifo() -> str:
-    """Create a named FIFO pipe for audio data."""
-    if os.path.exists(AUDIO_FIFO):
-        os.remove(AUDIO_FIFO)
-    os.mkfifo(AUDIO_FIFO)
-    log.info(f"Audio FIFO created: {AUDIO_FIFO}")
-    return AUDIO_FIFO
-
-
-def start_ffmpeg(rtmp_url: str) -> subprocess.Popen:
-    """Start FFmpeg with video on stdin and audio on a named FIFO."""
-
-    fifo = AUDIO_FIFO
-    if not os.path.exists(fifo):
-        setup_audio_fifo()
-
-    cmd = [
-        "ffmpeg", "-y",
-        # Input 0: raw video from stdin
-        "-f", "rawvideo", "-vcodec", "rawvideo",
-        "-pix_fmt", "rgb24", "-s", "720x1280", "-r", "15",
-        "-thread_queue_size", "512",
-        "-i", "pipe:0",
-        # Input 1: raw audio from named pipe
-        "-f", "s16le", "-ar", "44100", "-ac", "2",
-        "-thread_queue_size", "512",
-        "-i", fifo,
-        # Video encoding
-        "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
-        "-pix_fmt", "yuv420p", "-g", "30",
-        "-b:v", "2000k", "-maxrate", "2500k", "-bufsize", "4000k", "-r", "15",
-        # Audio encoding
-        "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
-        # Output
-        "-f", "flv", "-flvflags", "no_duration_filesize",
-        rtmp_url,
-    ]
-
-    log.info(f"FFmpeg cmd: {' '.join(cmd[:20])}...")
-
-    # Write stderr to file to avoid buffer deadlock
-    stderr_path = "/tmp/ffmpeg_stderr.log"
-    stderr_file = open(stderr_path, "w")
-
-    proc = subprocess.Popen(
-        cmd,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.DEVNULL,
-        stderr=stderr_file,
-    )
-
-    time.sleep(2)
-    if proc.poll() is not None:
-        stderr_file.close()
-        with open(stderr_path) as f:
-            err = f.read()
-        log.error(f"FFmpeg crashed! {err[-500:]}")
-        return None
-
-    # Start a thread to periodically log FFmpeg status
-    import threading
-    def _monitor_ffmpeg():
-        while proc.poll() is None:
-            time.sleep(30)
-        stderr_file.close()
-        with open(stderr_path) as f:
-            err = f.read()
-        # Log last 1500 chars to capture the actual error
-        log.warning(f"FFmpeg exited (code={proc.returncode})")
-        for line in err[-1500:].split('\n'):
-            if line.strip():
-                log.warning(f"  ffmpeg: {line.strip()}")
-    threading.Thread(target=_monitor_ffmpeg, daemon=True).start()
-
-    log.info("FFmpeg started ✓")
-    return proc
