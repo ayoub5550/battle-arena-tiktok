@@ -105,21 +105,21 @@ def prepare_music():
 def build_ffmpeg_cmd(rtmp_url: str, music_concat: str | None) -> list:
     """Build the FFmpeg command for video + music → RTMP."""
 
-    # Filter: speed up, scale to fit 9:16 with black bars, saturate colors
-    # Lightweight pipeline — no blur/split to avoid OOM on Railway
-    # Escape single quotes in title for drawtext
+    # Filter: speed up, 1:1 square crop (720x720), saturate colors
+    # Lightweight pipeline to avoid OOM on Railway
     safe_title = STREAM_TITLE.replace("'", "'\\''").replace(":", "\\:")
+    out_size = os.environ.get("OUTPUT_SIZE", "720")  # square
     vfilter = (
         f"[0:v]setpts=PTS/{VIDEO_SPEED},"
-        # Scale to fit 720 width, pad to 720x1280 (center with black bars)
-        f"scale=720:-2:force_original_aspect_ratio=decrease,"
-        f"pad=720:1280:(ow-iw)/2:(oh-ih)/2:color=0x0a0a0a,"
+        # Scale down early to save RAM, then crop to 1:1 square center
+        f"scale={out_size}:-2:force_original_aspect_ratio=decrease,"
+        f"crop={out_size}:{out_size},"
         # Color saturation
         f"eq=saturation={SATURATION},"
         # Title text at top
         f"drawtext=text='{safe_title}':"
-        f"fontsize=24:fontcolor=white:borderw=2:bordercolor=black@0.8:"
-        f"x=(w-text_w)/2:y=15:"
+        f"fontsize=22:fontcolor=white:borderw=2:bordercolor=black@0.8:"
+        f"x=(w-text_w)/2:y=10:"
         f"font=DejaVu Sans[v]"
     )
 
@@ -145,6 +145,7 @@ def build_ffmpeg_cmd(rtmp_url: str, music_concat: str | None) -> list:
     cmd = [
         "ffmpeg", "-y",
         "-loglevel", "warning",
+        "-re",  # Read at realtime speed — critical to avoid OOM buffering
         *inputs,
         "-filter_complex", full_filter,
         *maps,
